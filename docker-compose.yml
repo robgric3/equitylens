@@ -1,0 +1,171 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+    - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://equitylens:equitylens_password@timescaledb:5432/airflow
+    - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://equitylens:equitylens_password@timescaledb:5432/airflow
+    - AIRFLOW__CELERY__BROKER_URL=redis://:@redis:6379/0
+    - AIRFLOW__CORE__FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
+    - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+    - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/config:/opt/airflow/config
+  depends_on:
+    - timescaledb
+    - redis
+
+services:
+  # TimescaleDB (PostgreSQL with time-series extension)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: equitylens_timescaledb
+    environment:
+      - POSTGRES_USER=equitylens
+      - POSTGRES_PASSWORD=equitylens_password
+      - POSTGRES_DB=equitylens_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+
+  # Redis for Airflow Celery broker
+  redis:
+    image: redis:latest
+    container_name: equitylens_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # API service
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: equitylens_api
+    depends_on:
+      - timescaledb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app
+    environment:
+      - DATABASE_URL=postgresql://equitylens:equitylens_password@timescaledb:5432/equitylens_data
+    restart: unless-stopped
+
+  # Calculation Engine (new service)
+  calculation_engine:
+    build:
+      context: ./calculation_engine
+      dockerfile: Dockerfile
+    container_name: equitylens_calculation
+    depends_on:
+      - timescaledb
+      - api
+    volumes:
+      - ./calculation_engine:/app
+    environment:
+      - DATABASE_URL=postgresql://equitylens:equitylens_password@timescaledb:5432/equitylens_data
+    restart: unless-stopped
+
+  # React Dashboard (replacing Streamlit)
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: equitylens_dashboard
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./dashboard:/app
+    environment:
+      - API_URL=http://api:8000
+    restart: unless-stopped
+
+  # Airflow components (keeping the same structure)
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: equitylens_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: equitylens_airflow_scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: equitylens_airflow_worker
+    command: celery worker
+    restart: unless-stopped
+    depends_on:
+      - airflow-scheduler
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: equitylens_airflow_triggerer
+    command: triggerer
+    restart: unless-stopped
+    depends_on:
+      - airflow-scheduler
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: equitylens_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(PYTHONPATH=. python -c "import airflow; print(airflow.__version__)")
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo "Airflow version $${airflow_version} is less than the minimum version $${min_airflow_version}!"
+          exit 1
+        fi
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo "AIRFLOW_UID not set!"
+          if [[ "$(uname)" == "Darwin" ]]; then
+            echo "Using '50000' as default UID on macOS"
+            export AIRFLOW_UID=50000
+          else
+            echo "Using '$(id -u)' as default UID"
+            export AIRFLOW_UID=$(id -u)
+          fi
+        fi
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins}
+        exec airflow db init && 
+        airflow db upgrade &&
+        airflow users create \
+          --username airflow \
+          --firstname airflow \
+          --lastname airflow \
+          --role Admin \
+          --email airflow@example.com \
+          --password airflow
+    restart: on-failure
+
+volumes:
+  timescale_data:
